@@ -1,607 +1,1625 @@
 <?php
 require __DIR__ . '/includes/auth.php';
-require_once __DIR__ . '/includes/audit.php';
 auth_require_roles(['Admin', 'Employee']);
 require __DIR__ . '/config/db.php';
 
-$user = auth_current_user();
-$isEmployee = $user['role'] === 'Employee';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    auth_require_roles(['Admin']);
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
 }
-$employeeId = $isEmployee
-    ? filter_var($user['employee_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
-    : null;
-$pageTitle = $isEmployee ? 'My payroll' : 'Payroll';
+
+$currentUser = auth_current_user();
+$isAdmin = (($currentUser['role'] ?? '') === 'Admin');
+
+$pageTitle = $isAdmin ? 'Payroll Management' : 'My Payroll';
 $activePage = 'payroll';
-$perPage = 20;
-$notice = $_SESSION['payroll_notice'] ?? null;
-unset($_SESSION['payroll_notice']);
-$formValues = $_SESSION['payroll_form_values'] ?? [
-    'employee_id' => '',
-    'pay_period_start' => '',
-    'pay_period_end' => '',
-    'basic_salary' => '',
-    'allowances' => '0.00',
-    'overtime_pay' => '0.00',
-    'deductions' => '0.00',
+
+$payrollError = null;
+$successMessage = null;
+$payrollRecords = [];
+$selectedPayroll = null;
+$employeeId = null;
+
+$payrollStats = [
+    'total' => 0,
+    'pending' => 0,
+    'paid' => 0,
+    'total_amount' => 0
 ];
-unset($_SESSION['payroll_form_values']);
-$employees = [];
-$records = [];
-$totalRecords = 0;
-$totalPages = 1;
-$errorMessage = null;
-$page = isset($_GET['page']) && is_scalar($_GET['page'])
-    ? filter_var($_GET['page'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
-    : 1;
-$page = $page === false ? 1 : $page;
 
-$validDate = static function (string $date): bool {
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/D', $date)) {
-        return false;
-    }
-    $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $date);
-    $errors = DateTimeImmutable::getLastErrors();
-    return $parsed !== false
-        && $parsed->format('Y-m-d') === $date
-        && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0));
-};
-$toCents = static function (string $amount): ?int {
-    if (!preg_match('/^\d{1,10}(?:\.\d{1,2})?$/D', $amount)) {
-        return null;
-    }
-    $parts = explode('.', $amount, 2);
-    $whole = (int) $parts[0];
-    $fraction = isset($parts[1]) ? (int) str_pad($parts[1], 2, '0') : 0;
-    $cents = $whole * 100 + $fraction;
-    return $cents <= 999999999999 ? $cents : null;
-};
-$formatMoney = static function (int $cents): string {
-    return number_format(intdiv($cents, 100), 0, '.', ',') . '.' . str_pad((string) ($cents % 100), 2, '0');
-};
-$formatDecimal = static function (int $cents): string {
-    return (string) intdiv($cents, 100) . '.' . str_pad((string) ($cents % 100), 2, '0');
-};
-$displayMoney = static function ($amount) use ($toCents, $formatMoney): string {
-    $cents = $toCents((string) ($amount ?? '0.00'));
-    return $cents === null ? '0.00' : $formatMoney($cents);
-};
-$escape = static function ($value): string {
-    return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
-};
-
-if ($isEmployee && $employeeId === false) {
-    http_response_code(403);
-    $errorMessage = 'This account is not linked to an employee record. Contact HR for assistance.';
+if (empty($_SESSION['payroll_csrf'])) {
+    $_SESSION['payroll_csrf'] = bin2hex(random_bytes(32));
 }
 
-if (!$isEmployee && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = isset($_POST['action']) && is_string($_POST['action']) ? $_POST['action'] : '';
-    $noticeType = 'error';
-    $message = 'Payroll could not be updated. Please try again.';
+$csrfToken = $_SESSION['payroll_csrf'];
 
-    if (!auth_csrf_is_valid($_POST['csrf_token'] ?? null)) {
-        $message = 'Your session expired. Please reload the page and try again.';
-    } elseif ($action === 'generate') {
-        $formValues = [
-            'employee_id' => isset($_POST['employee_id']) && is_string($_POST['employee_id']) ? trim($_POST['employee_id']) : '',
-            'pay_period_start' => isset($_POST['pay_period_start']) && is_string($_POST['pay_period_start']) ? trim($_POST['pay_period_start']) : '',
-            'pay_period_end' => isset($_POST['pay_period_end']) && is_string($_POST['pay_period_end']) ? trim($_POST['pay_period_end']) : '',
-            'basic_salary' => isset($_POST['basic_salary']) && is_string($_POST['basic_salary']) ? trim($_POST['basic_salary']) : '',
-            'allowances' => isset($_POST['allowances']) && is_string($_POST['allowances']) ? trim($_POST['allowances']) : '',
-            'overtime_pay' => isset($_POST['overtime_pay']) && is_string($_POST['overtime_pay']) ? trim($_POST['overtime_pay']) : '',
-            'deductions' => isset($_POST['deductions']) && is_string($_POST['deductions']) ? trim($_POST['deductions']) : '',
+/* ==========================================
+   HELPER FUNCTIONS
+========================================== */
+
+function payroll_escape($value): string
+{
+    return htmlspecialchars(
+        (string)($value ?? ''),
+        ENT_QUOTES,
+        'UTF-8'
+    );
+}
+
+function payroll_money($amount): string
+{
+    return '₱' . number_format((float)$amount, 2);
+}
+
+function payroll_audit(
+    PDO $pdo,
+    array $currentUser,
+    string $action,
+    int $entityId,
+    array $details
+): void {
+    $stmt = $pdo->prepare(
+        "INSERT INTO audit_logs
+        (actor_user_id, action, entity_type, entity_id, details)
+        VALUES (:actor, :action, 'payroll', :entity, :details)"
+    );
+
+    $stmt->execute([
+        ':actor' => $currentUser['user_id'] ?? null,
+        ':action' => $action,
+        ':entity' => $entityId,
+        ':details' => json_encode($details)
+    ]);
+}
+
+function payroll_period(
+    int $year,
+    int $month,
+    string $cutoff
+): array {
+    $firstDay = new DateTime(
+        sprintf('%04d-%02d-01', $year, $month)
+    );
+
+    $lastDay = new DateTime($firstDay->format('Y-m-t'));
+
+    if ($cutoff === 'first') {
+        return [
+            $firstDay->format('Y-m-d'),
+            sprintf('%04d-%02d-15', $year, $month)
         ];
-        $selectedEmployee = filter_var($formValues['employee_id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-        $basicCents = $toCents($formValues['basic_salary']);
-        $allowanceCents = $toCents($formValues['allowances']);
-        $overtimeCents = $toCents($formValues['overtime_pay']);
-        $deductionCents = $toCents($formValues['deductions']);
+    }
 
-        if ($selectedEmployee === false
-            || !$validDate($formValues['pay_period_start'])
-            || !$validDate($formValues['pay_period_end'])
-        ) {
-            $message = 'Select an employee and enter valid pay period dates.';
-        } elseif ($formValues['pay_period_end'] < $formValues['pay_period_start']) {
-            $message = 'The pay period end date must be on or after the start date.';
-        } elseif ($basicCents === null || $allowanceCents === null || $overtimeCents === null || $deductionCents === null) {
-            $message = 'Enter nonnegative amounts with no more than 10 whole digits and 2 decimal places.';
-        } else {
-            $grossCents = $basicCents + $allowanceCents + $overtimeCents;
-            if ($grossCents > 999999999999 || $deductionCents > $grossCents) {
-                $message = $grossCents > 999999999999
-                    ? 'Gross salary exceeds the maximum supported by the payroll table.'
-                    : 'Deductions cannot exceed gross salary.';
-            } else {
-                $netCents = $grossCents - $deductionCents;
-                try {
-                    $pdo->beginTransaction();
-                    $employeeLock = $pdo->prepare(
-                        'SELECT employee_id FROM employees WHERE employee_id = :employee_id FOR UPDATE'
-                    );
-                    $employeeLock->execute([':employee_id' => $selectedEmployee]);
-                    if ($employeeLock->fetchColumn() === false) {
-                        $pdo->rollBack();
-                        $message = 'The selected employee could not be found.';
-                    } else {
-                        $duplicate = $pdo->prepare(
-                            'SELECT payroll_id
-                             FROM payroll
-                             WHERE employee_id = :employee_id
-                               AND pay_period_start = :pay_period_start
-                               AND pay_period_end = :pay_period_end
-                             LIMIT 1'
-                        );
-                        $duplicate->execute([
-                            ':employee_id' => $selectedEmployee,
-                            ':pay_period_start' => $formValues['pay_period_start'],
-                            ':pay_period_end' => $formValues['pay_period_end'],
-                        ]);
-                        if ($duplicate->fetchColumn() !== false) {
-                            $pdo->rollBack();
-                            $message = 'Payroll already exists for this employee and pay period; existing payroll was not changed.';
-                        } else {
-                            $insert = $pdo->prepare(
-                                "INSERT INTO payroll
-                                    (employee_id, pay_period_start, pay_period_end,
-                                     basic_salary, allowances, overtime_pay, deductions,
-                                     gross_salary, net_salary, payment_status)
-                                 VALUES
-                                    (:employee_id, :period_start, :period_end,
-                                     :basic_salary, :allowances, :overtime_pay, :deductions,
-                                     :gross_salary, :net_salary, 'Pending')"
-                            );
-                            $insert->execute([
-                                ':employee_id' => $selectedEmployee,
-                                ':period_start' => $formValues['pay_period_start'],
-                                ':period_end' => $formValues['pay_period_end'],
-                                ':basic_salary' => $formatDecimal($basicCents),
-                                ':allowances' => $formatDecimal($allowanceCents),
-                                ':overtime_pay' => $formatDecimal($overtimeCents),
-                                ':deductions' => $formatDecimal($deductionCents),
-                                ':gross_salary' => $formatDecimal($grossCents),
-                                ':net_salary' => $formatDecimal($netCents),
-                            ]);
-                            $payrollId = (int) $pdo->lastInsertId();
-                            audit_record(
-                                $pdo,
-                                'payroll_generated',
-                                'payroll',
-                                $payrollId,
-                                [
-                                    'employee_id' => (int) $selectedEmployee,
-                                    'pay_period_start' => $formValues['pay_period_start'],
-                                    'pay_period_end' => $formValues['pay_period_end'],
-                                ],
-                                (int) $user['user_id']
-                            );
-                            $pdo->commit();
-                            $_SESSION['payroll_notice'] = ['type' => 'success', 'message' => 'Payroll generated successfully.'];
-                            header('Location: payroll-details.php?id=' . $payrollId);
-                            exit;
-                        }
-                    }
-                } catch (PDOException $e) {
-                    if ($pdo->inTransaction()) {
-                        $pdo->rollBack();
-                    }
-                    error_log('Payroll generation failed: ' . $e->getMessage());
-                    $message = 'Payroll could not be generated. Please try again.';
-                }
-            }
-        }
-        $_SESSION['payroll_form_values'] = $formValues;
-    } elseif ($action === 'update_pending') {
-        $payrollId = filter_var($_POST['payroll_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-        $editValues = [
-            'pay_period_start' => isset($_POST['pay_period_start']) && is_string($_POST['pay_period_start']) ? trim($_POST['pay_period_start']) : '',
-            'pay_period_end' => isset($_POST['pay_period_end']) && is_string($_POST['pay_period_end']) ? trim($_POST['pay_period_end']) : '',
-            'basic_salary' => isset($_POST['basic_salary']) && is_string($_POST['basic_salary']) ? trim($_POST['basic_salary']) : '',
-            'allowances' => isset($_POST['allowances']) && is_string($_POST['allowances']) ? trim($_POST['allowances']) : '',
-            'overtime_pay' => isset($_POST['overtime_pay']) && is_string($_POST['overtime_pay']) ? trim($_POST['overtime_pay']) : '',
-            'deductions' => isset($_POST['deductions']) && is_string($_POST['deductions']) ? trim($_POST['deductions']) : '',
-        ];
-        $basicCents = $toCents($editValues['basic_salary']);
-        $allowanceCents = $toCents($editValues['allowances']);
-        $overtimeCents = $toCents($editValues['overtime_pay']);
-        $deductionCents = $toCents($editValues['deductions']);
-        $grossCents = null;
+    return [
+        sprintf('%04d-%02d-16', $year, $month),
+        $lastDay->format('Y-m-d')
+    ];
+}
 
-        if ($payrollId === false) {
-            $message = 'Select a valid payroll record.';
-        } elseif (!$validDate($editValues['pay_period_start']) || !$validDate($editValues['pay_period_end'])) {
-            $message = 'Enter valid pay period dates.';
-        } elseif ($editValues['pay_period_end'] < $editValues['pay_period_start']) {
-            $message = 'The pay period end date must be on or after the start date.';
-        } elseif ($basicCents === null || $allowanceCents === null || $overtimeCents === null || $deductionCents === null) {
-            $message = 'Enter nonnegative amounts with no more than 10 whole digits and 2 decimal places.';
-        } else {
-            $grossCents = $basicCents + $allowanceCents + $overtimeCents;
-            if ($grossCents > 999999999999 || $deductionCents > $grossCents) {
-                $message = $grossCents > 999999999999
-                    ? 'Gross salary exceeds the maximum supported by the payroll table.'
-                    : 'Deductions cannot exceed gross salary.';
-            } else {
-                try {
-                    $pdo->beginTransaction();
-                    $ownerQuery = $pdo->prepare(
-                        'SELECT employee_id FROM payroll WHERE payroll_id = :payroll_id'
-                    );
-                    $ownerQuery->execute([':payroll_id' => $payrollId]);
-                    $recordEmployeeId = $ownerQuery->fetchColumn();
+/* ==========================================
+   HANDLE PAYROLL ACTIONS
+========================================== */
 
-                    if ($recordEmployeeId === false) {
-                        $pdo->rollBack();
-                        $message = 'The payroll record was not found.';
-                    } else {
-                        $employeeLock = $pdo->prepare(
-                            'SELECT employee_id FROM employees WHERE employee_id = :employee_id FOR UPDATE'
-                        );
-                        $employeeLock->execute([':employee_id' => (int) $recordEmployeeId]);
-                        $employeeLock->fetchColumn();
-
-                        $lockRecord = $pdo->prepare(
-                            'SELECT payment_status FROM payroll WHERE payroll_id = :payroll_id FOR UPDATE'
-                        );
-                        $lockRecord->execute([':payroll_id' => $payrollId]);
-                        $paymentStatus = $lockRecord->fetchColumn();
-
-                        if ($paymentStatus === false) {
-                            $pdo->rollBack();
-                            $message = 'The payroll record was not found.';
-                        } elseif ($paymentStatus !== 'Pending') {
-                            $pdo->rollBack();
-                            $message = 'Only pending payroll can be edited.';
-                        } else {
-                            $netCents = $grossCents - $deductionCents;
-                            $duplicate = $pdo->prepare(
-                                'SELECT payroll_id
-                                 FROM payroll
-                                 WHERE employee_id = :employee_id
-                                   AND pay_period_start = :pay_period_start
-                                   AND pay_period_end = :pay_period_end
-                                   AND payroll_id <> :payroll_id
-                                 LIMIT 1'
-                            );
-                            $duplicate->execute([
-                                ':employee_id' => (int) $recordEmployeeId,
-                                ':pay_period_start' => $editValues['pay_period_start'],
-                                ':pay_period_end' => $editValues['pay_period_end'],
-                                ':payroll_id' => $payrollId,
-                            ]);
-                            if ($duplicate->fetchColumn() !== false) {
-                                $pdo->rollBack();
-                                $message = 'Payroll already exists for this employee and pay period; the existing record was not changed.';
-                            } else {
-                                $update = $pdo->prepare(
-                                    'UPDATE payroll
-                                     SET pay_period_start = :period_start,
-                                         pay_period_end = :period_end,
-                                         basic_salary = :basic_salary,
-                                         allowances = :allowances,
-                                         overtime_pay = :overtime_pay,
-                                         deductions = :deductions,
-                                         gross_salary = :gross_salary,
-                                         net_salary = :net_salary
-                                     WHERE payroll_id = :payroll_id
-                                       AND payment_status = :payment_status'
-                                );
-                                $update->execute([
-                                    ':period_start' => $editValues['pay_period_start'],
-                                    ':period_end' => $editValues['pay_period_end'],
-                                    ':basic_salary' => $formatDecimal($basicCents),
-                                    ':allowances' => $formatDecimal($allowanceCents),
-                                    ':overtime_pay' => $formatDecimal($overtimeCents),
-                                    ':deductions' => $formatDecimal($deductionCents),
-                                    ':gross_salary' => $formatDecimal($grossCents),
-                                    ':net_salary' => $formatDecimal($netCents),
-                                    ':payroll_id' => $payrollId,
-                                    ':payment_status' => 'Pending',
-                                ]);
-                                audit_record(
-                                    $pdo,
-                                    'payroll_updated',
-                                    'payroll',
-                                    (int) $payrollId,
-                                    [
-                                        'employee_id' => (int) $recordEmployeeId,
-                                        'pay_period_start' => $editValues['pay_period_start'],
-                                        'pay_period_end' => $editValues['pay_period_end'],
-                                        'amounts_omitted' => true,
-                                    ],
-                                    (int) $user['user_id']
-                                );
-                                $pdo->commit();
-                                $_SESSION['payroll_notice'] = ['type' => 'success', 'message' => 'Pending payroll updated successfully.'];
-                                header('Location: payroll-details.php?id=' . (int) $payrollId);
-                                exit;
-                            }
-                        }
-                    }
-                } catch (Throwable $e) {
-                    if ($pdo->inTransaction()) {
-                        $pdo->rollBack();
-                    }
-                    error_log('Pending payroll update failed: ' . $e->getMessage());
-                    $message = 'Payroll could not be updated. Please try again.';
-                }
-            }
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        if (!hash_equals(
+            $csrfToken,
+            $_POST['csrf_token'] ?? ''
+        )) {
+            throw new RuntimeException(
+                'Invalid request token. Please refresh the page.'
+            );
         }
 
-        if ($payrollId !== false) {
-            $_SESSION['payroll_edit_form_values'][(int) $payrollId] = $editValues;
-            $_SESSION['payroll_notice_redirect'] = (int) $payrollId;
+        if (!$isAdmin) {
+            throw new RuntimeException(
+                'You are not authorized to manage payroll.'
+            );
         }
-    } elseif ($action === 'set_status') {
-        $payrollId = filter_var($_POST['payroll_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-        $requestedStatus = isset($_POST['payment_status']) && is_string($_POST['payment_status'])
-            ? $_POST['payment_status']
-            : '';
-        if ($payrollId === false || !in_array($requestedStatus, ['Pending', 'Paid'], true)) {
-            $message = 'Select a valid payroll record.';
-        } else {
-            try {
-                $pdo->beginTransaction();
-                $lockRecord = $pdo->prepare(
-                    'SELECT payment_status FROM payroll WHERE payroll_id = :payroll_id FOR UPDATE'
+
+        $action = $_POST['action'] ?? '';
+
+        /* GENERATE PAYROLL */
+
+        if ($action === 'generate') {
+            $month = filter_var(
+                $_POST['month'] ?? null,
+                FILTER_VALIDATE_INT
+            );
+
+            $year = filter_var(
+                $_POST['year'] ?? null,
+                FILTER_VALIDATE_INT
+            );
+
+            $cutoff = $_POST['cutoff'] ?? '';
+
+            if (!$month || $month < 1 || $month > 12) {
+                throw new RuntimeException(
+                    'Please select a valid month.'
                 );
-                $lockRecord->execute([':payroll_id' => $payrollId]);
-                $paymentStatus = $lockRecord->fetchColumn();
-                if ($paymentStatus === false) {
-                    $pdo->rollBack();
-                    $message = 'The payroll record was not found.';
-                } elseif ($paymentStatus === $requestedStatus) {
-                    $pdo->rollBack();
-                    $message = 'The payroll record already has that payment status.';
-                } else {
-                    $update = $requestedStatus === 'Paid'
-                        ? $pdo->prepare(
-                            "UPDATE payroll
-                             SET payment_status = 'Paid', payment_date = CURRENT_DATE()
-                             WHERE payroll_id = :payroll_id AND payment_status = 'Pending'"
-                        )
-                        : $pdo->prepare(
-                            "UPDATE payroll
-                             SET payment_status = 'Pending', payment_date = NULL
-                             WHERE payroll_id = :payroll_id AND payment_status = 'Paid'"
-                        );
-                    $update->execute([':payroll_id' => $payrollId]);
-                    if ($update->rowCount() !== 1) {
-                        throw new RuntimeException('The payroll record changed during payment processing.');
-                    }
-                    audit_record(
-                        $pdo,
-                        'payroll_status_changed',
-                        'payroll',
-                        (int) $payrollId,
-                        [
-                            'previous_status' => (string) $paymentStatus,
-                            'new_status' => $requestedStatus,
-                        ],
-                        (int) $user['user_id']
-                    );
-                    $pdo->commit();
-                    $noticeType = 'success';
-                    $message = $requestedStatus === 'Paid'
-                        ? 'Payroll marked as paid.'
-                        : 'Payroll marked as unpaid.';
-                }
-            } catch (Throwable $e) {
-                if ($pdo->inTransaction()) {
-                    $pdo->rollBack();
-                }
-                error_log('Payroll payment processing failed: ' . $e->getMessage());
-                $message = 'Payment status could not be updated. Please try again.';
             }
+
+            if (!$year || $year < 2000 || $year > 2100) {
+                throw new RuntimeException(
+                    'Please enter a valid year.'
+                );
+            }
+
+            if (!in_array($cutoff, ['first', 'second'], true)) {
+                throw new RuntimeException(
+                    'Please select a valid cutoff.'
+                );
+            }
+
+            [$periodStart, $periodEnd] = payroll_period(
+                $year,
+                $month,
+                $cutoff
+            );
+
+            $employees = $pdo->query(
+                "SELECT employee_id, first_name, last_name, basic_salary
+                 FROM employees
+                 WHERE employment_status = 'Active'
+                 ORDER BY last_name, first_name"
+            )->fetchAll(PDO::FETCH_ASSOC);
+
+            if (!$employees) {
+                throw new RuntimeException(
+                    'There are no active employees to process.'
+                );
+            }
+
+            $pdo->beginTransaction();
+
+            $checkStmt = $pdo->prepare(
+                "SELECT payroll_id
+                 FROM payroll
+                 WHERE employee_id = :employee_id
+                   AND pay_period_start = :period_start
+                   AND pay_period_end = :period_end
+                 LIMIT 1"
+            );
+
+            $insertStmt = $pdo->prepare(
+                "INSERT INTO payroll (
+                    employee_id,
+                    pay_period_start,
+                    pay_period_end,
+                    basic_salary,
+                    allowances,
+                    overtime_pay,
+                    deductions,
+                    gross_salary,
+                    net_salary,
+                    payment_status
+                ) VALUES (
+                    :employee_id,
+                    :period_start,
+                    :period_end,
+                    :basic_salary,
+                    0, 0, 0,
+                    :gross_salary,
+                    :net_salary,
+                    'Pending'
+                )"
+            );
+
+            $generated = 0;
+            $skipped = 0;
+
+            foreach ($employees as $employee) {
+                $checkStmt->execute([
+                    ':employee_id' => $employee['employee_id'],
+                    ':period_start' => $periodStart,
+                    ':period_end' => $periodEnd
+                ]);
+
+                if ($checkStmt->fetch()) {
+                    $skipped++;
+                    continue;
+                }
+
+                $basicSalary = round(
+                    (float)$employee['basic_salary'] / 2,
+                    2
+                );
+
+                $insertStmt->execute([
+                    ':employee_id' => $employee['employee_id'],
+                    ':period_start' => $periodStart,
+                    ':period_end' => $periodEnd,
+                    ':basic_salary' => $basicSalary,
+                    ':gross_salary' => $basicSalary,
+                    ':net_salary' => $basicSalary
+                ]);
+
+                $payrollId = (int)$pdo->lastInsertId();
+
+                payroll_audit(
+                    $pdo,
+                    $currentUser,
+                    'payroll_generated',
+                    $payrollId,
+                    [
+                        'employee_id' => (int)$employee['employee_id'],
+                        'employee_name' =>
+                            $employee['first_name'] . ' ' .
+                            $employee['last_name'],
+                        'period_start' => $periodStart,
+                        'period_end' => $periodEnd,
+                        'basic_salary' => $basicSalary
+                    ]
+                );
+
+                $generated++;
+            }
+
+            $pdo->commit();
+
+            $successMessage =
+                "Payroll generation completed. {$generated} record(s) created and {$skipped} duplicate record(s) skipped.";
         }
-    } else {
-        http_response_code(400);
-        $message = 'Invalid payroll action.';
-    }
 
-    $_SESSION['payroll_notice'] = ['type' => $noticeType, 'message' => $message];
-    $redirectPayrollId = $_SESSION['payroll_notice_redirect'] ?? null;
-    unset($_SESSION['payroll_notice_redirect']);
-    header('Location: ' . ($redirectPayrollId !== null
-        ? 'payroll-details.php?id=' . (int) $redirectPayrollId
-        : 'payroll.php'));
-    exit;
-}
+        /* UPDATE PAYROLL AMOUNTS */
 
-$search = isset($_GET['search']) && is_string($_GET['search']) ? substr(trim($_GET['search']), 0, 100) : '';
-$periodFrom = isset($_GET['period_from']) && is_string($_GET['period_from']) ? trim($_GET['period_from']) : '';
-$periodTo = isset($_GET['period_to']) && is_string($_GET['period_to']) ? trim($_GET['period_to']) : '';
-$statusFilter = isset($_GET['status']) && is_string($_GET['status']) ? $_GET['status'] : '';
-if (!in_array($statusFilter, ['Pending', 'Paid'], true)) {
-    $statusFilter = '';
-}
-foreach ([$periodFrom, $periodTo] as $filterDate) {
-    if ($filterDate !== '' && !$validDate($filterDate)) {
-        $errorMessage = 'Enter valid pay period filter dates.';
-        break;
+        elseif ($action === 'update_amounts') {
+            $payrollId = filter_var(
+                $_POST['payroll_id'] ?? null,
+                FILTER_VALIDATE_INT
+            );
+
+            $allowances = filter_var(
+                $_POST['allowances'] ?? null,
+                FILTER_VALIDATE_FLOAT
+            );
+
+            $overtime = filter_var(
+                $_POST['overtime_pay'] ?? null,
+                FILTER_VALIDATE_FLOAT
+            );
+
+            $deductions = filter_var(
+                $_POST['deductions'] ?? null,
+                FILTER_VALIDATE_FLOAT
+            );
+
+            if (
+                !$payrollId ||
+                $allowances === false ||
+                $overtime === false ||
+                $deductions === false
+            ) {
+                throw new RuntimeException(
+                    'Please enter valid payroll amounts.'
+                );
+            }
+
+            if (
+                $allowances < 0 ||
+                $overtime < 0 ||
+                $deductions < 0
+            ) {
+                throw new RuntimeException(
+                    'Payroll amounts cannot be negative.'
+                );
+            }
+
+            $stmt = $pdo->prepare(
+                "SELECT basic_salary, payment_status
+                 FROM payroll
+                 WHERE payroll_id = :id"
+            );
+
+            $stmt->execute([':id' => $payrollId]);
+
+            $record = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$record) {
+                throw new RuntimeException(
+                    'Payroll record not found.'
+                );
+            }
+
+            if ($record['payment_status'] !== 'Pending') {
+                throw new RuntimeException(
+                    'Paid payroll records cannot be edited.'
+                );
+            }
+
+            $basicSalary = (float)$record['basic_salary'];
+
+            $grossSalary = round(
+                $basicSalary + $allowances + $overtime,
+                2
+            );
+
+            $netSalary = round(
+                $grossSalary - $deductions,
+                2
+            );
+
+            if ($netSalary < 0) {
+                throw new RuntimeException(
+                    'Deductions cannot exceed the gross salary.'
+                );
+            }
+
+            $updateStmt = $pdo->prepare(
+                "UPDATE payroll
+                 SET allowances = :allowances,
+                     overtime_pay = :overtime,
+                     deductions = :deductions,
+                     gross_salary = :gross_salary,
+                     net_salary = :net_salary
+                 WHERE payroll_id = :id
+                   AND payment_status = 'Pending'"
+            );
+
+            $updateStmt->execute([
+                ':allowances' => $allowances,
+                ':overtime' => $overtime,
+                ':deductions' => $deductions,
+                ':gross_salary' => $grossSalary,
+                ':net_salary' => $netSalary,
+                ':id' => $payrollId
+            ]);
+
+            payroll_audit(
+                $pdo,
+                $currentUser,
+                'payroll_updated',
+                $payrollId,
+                [
+                    'allowances' => $allowances,
+                    'overtime_pay' => $overtime,
+                    'deductions' => $deductions,
+                    'gross_salary' => $grossSalary,
+                    'net_salary' => $netSalary
+                ]
+            );
+
+            $successMessage =
+                'Payroll amounts and deductions updated successfully.';
+        }
+
+        /* MARK AS PAID */
+
+        elseif ($action === 'mark_paid') {
+            $payrollId = filter_var(
+                $_POST['payroll_id'] ?? null,
+                FILTER_VALIDATE_INT
+            );
+
+            if (!$payrollId) {
+                throw new RuntimeException(
+                    'Invalid payroll record.'
+                );
+            }
+
+            $stmt = $pdo->prepare(
+                "UPDATE payroll
+                 SET payment_status = 'Paid',
+                     payment_date = CURRENT_DATE()
+                 WHERE payroll_id = :id
+                   AND payment_status = 'Pending'"
+            );
+
+            $stmt->execute([':id' => $payrollId]);
+
+            if ($stmt->rowCount() === 0) {
+                throw new RuntimeException(
+                    'Record not found or already paid.'
+                );
+            }
+
+            payroll_audit(
+                $pdo,
+                $currentUser,
+                'payroll_marked_paid',
+                $payrollId,
+                [
+                    'payment_status' => 'Paid',
+                    'payment_date' => date('Y-m-d')
+                ]
+            );
+
+            $successMessage =
+                'Payroll successfully marked as paid.';
+        }
+
+        else {
+            throw new RuntimeException(
+                'Invalid payroll action.'
+            );
+        }
+
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        if ($e instanceof PDOException) {
+            error_log('Payroll database error: ' . $e->getMessage());
+
+            $payrollError =
+                'A database error occurred. Please check the server log.';
+        } else {
+            $payrollError = $e->getMessage();
+        }
     }
 }
-if ($errorMessage === null && $periodFrom !== '' && $periodTo !== '' && $periodFrom > $periodTo) {
-    $errorMessage = 'The pay period start filter must be on or before the end filter.';
-}
+
+/* ==========================================
+   LOAD PAYROLL INFORMATION
+========================================== */
 
 try {
-    if (!$isEmployee) {
-        $employees = $pdo->query(
-            "SELECT employee_id, employee_code, first_name, last_name
-             FROM employees
-             ORDER BY last_name, first_name, employee_code"
-        )->fetchAll();
-    }
+    if ($isAdmin) {
+        $payrollStats = $pdo->query(
+            "SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(payment_status = 'Pending'), 0) AS pending,
+                COALESCE(SUM(payment_status = 'Paid'), 0) AS paid,
+                COALESCE(SUM(net_salary), 0) AS total_amount
+             FROM payroll"
+        )->fetch(PDO::FETCH_ASSOC);
 
-    $where = [];
-    $parameters = [];
-    if ($isEmployee) {
-        $where[] = 'p.employee_id = :employee_id';
-        $parameters[':employee_id'] = (int) $employeeId;
-    } elseif ($search !== '') {
-        $searchConditions = [
-            'e.first_name LIKE :first_search',
-            'e.last_name LIKE :last_search',
-            'e.employee_code LIKE :code_search',
-        ];
-        $term = '%' . $search . '%';
-        $parameters[':first_search'] = $term;
-        $parameters[':last_search'] = $term;
-        $parameters[':code_search'] = $term;
-        if (ctype_digit($search)) {
-            $searchConditions[] = 'e.employee_id = :employee_id_search';
-            $parameters[':employee_id_search'] = (int) $search;
+        $stmt = $pdo->query(
+            "SELECT p.*, e.employee_code, e.first_name,
+                    e.last_name, e.position, d.department_name
+             FROM payroll p
+             INNER JOIN employees e
+                ON e.employee_id = p.employee_id
+             LEFT JOIN departments d
+                ON d.department_id = e.department_id
+             ORDER BY p.pay_period_start DESC, p.payroll_id DESC"
+        );
+
+        $payrollRecords = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    } else {
+        $employeeId = $currentUser['employee_id'] ?? null;
+
+        if (!$employeeId) {
+            throw new RuntimeException(
+                'Your account is not connected to an employee record.'
+            );
         }
-        $where[] = '(' . implode(' OR ', $searchConditions) . ')';
-    }
-    if ($periodFrom !== '') {
-        $where[] = 'p.pay_period_end >= :period_from';
-        $parameters[':period_from'] = $periodFrom;
-    }
-    if ($periodTo !== '') {
-        $where[] = 'p.pay_period_start <= :period_to';
-        $parameters[':period_to'] = $periodTo;
-    }
-    if ($statusFilter !== '') {
-        $where[] = 'p.payment_status = :payment_status';
-        $parameters[':payment_status'] = $statusFilter;
-    }
-    $whereSql = $where !== [] ? ' WHERE ' . implode(' AND ', $where) : '';
 
-    $count = $pdo->prepare(
-        'SELECT COUNT(*)
-         FROM payroll AS p
-         INNER JOIN employees AS e ON e.employee_id = p.employee_id'
-         . $whereSql
-    );
-    $count->execute($parameters);
-    $totalRecords = (int) $count->fetchColumn();
-    $totalPages = max(1, (int) ceil($totalRecords / $perPage));
-    $page = min($page, $totalPages);
-    $listing = $pdo->prepare(
-        'SELECT p.payroll_id, p.employee_id, p.pay_period_start, p.pay_period_end,
-                p.basic_salary, p.allowances, p.overtime_pay, p.deductions,
-                p.gross_salary, p.net_salary, p.payment_status, p.payment_date,
-                e.employee_code, e.first_name, e.last_name, d.department_name
-         FROM payroll AS p
-         INNER JOIN employees AS e ON e.employee_id = p.employee_id
-         LEFT JOIN departments AS d ON d.department_id = e.department_id'
-         . $whereSql .
-        ' ORDER BY p.pay_period_end DESC, p.payroll_id DESC
-          LIMIT :limit OFFSET :offset'
-    );
-    foreach ($parameters as $name => $value) {
-        $listing->bindValue($name, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        $stmt = $pdo->prepare(
+            "SELECT p.*, e.employee_code, e.first_name,
+                    e.last_name, e.position, d.department_name
+             FROM payroll p
+             INNER JOIN employees e
+                ON e.employee_id = p.employee_id
+             LEFT JOIN departments d
+                ON d.department_id = e.department_id
+             WHERE p.employee_id = :employee_id
+             ORDER BY p.pay_period_start DESC, p.payroll_id DESC"
+        );
+
+        $stmt->execute([
+            ':employee_id' => $employeeId
+        ]);
+
+        $payrollRecords = $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
-    $listing->bindValue(':limit', $perPage, PDO::PARAM_INT);
-    $listing->bindValue(':offset', ($page - 1) * $perPage, PDO::PARAM_INT);
-    $listing->execute();
-    $records = $listing->fetchAll();
-} catch (PDOException $e) {
-    error_log('Payroll listing failed: ' . $e->getMessage());
-    $errorMessage = 'Payroll records could not be loaded. Please try again later.';
+
+    /* ==========================================
+       LOAD SELECTED PAYSLIP FOR BOTH ROLES
+    ========================================== */
+
+    if (isset($_GET['view'])) {
+        $viewId = filter_var(
+            $_GET['view'],
+            FILTER_VALIDATE_INT
+        );
+
+        if (!$viewId) {
+            throw new RuntimeException(
+                'Invalid payslip selection.'
+            );
+        }
+
+        if ($isAdmin) {
+            // Admin can view any employee's payroll.
+            $detailStmt = $pdo->prepare(
+                "SELECT p.*, e.employee_code, e.first_name,
+                        e.middle_name, e.last_name, e.position,
+                        e.email, d.department_name
+                 FROM payroll p
+                 INNER JOIN employees e
+                    ON e.employee_id = p.employee_id
+                 LEFT JOIN departments d
+                    ON d.department_id = e.department_id
+                 WHERE p.payroll_id = :id"
+            );
+
+            $detailStmt->execute([
+                ':id' => $viewId
+            ]);
+
+        } else {
+            // Employee can only view their own payslip.
+            $detailStmt = $pdo->prepare(
+                "SELECT p.*, e.employee_code, e.first_name,
+                        e.middle_name, e.last_name, e.position,
+                        e.email, d.department_name
+                 FROM payroll p
+                 INNER JOIN employees e
+                    ON e.employee_id = p.employee_id
+                 LEFT JOIN departments d
+                    ON d.department_id = e.department_id
+                 WHERE p.payroll_id = :id
+                   AND p.employee_id = :employee_id"
+            );
+
+            $detailStmt->execute([
+                ':id' => $viewId,
+                ':employee_id' => $employeeId
+            ]);
+        }
+
+        $selectedPayroll = $detailStmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$selectedPayroll) {
+            throw new RuntimeException(
+                'Payslip not found or you are not authorized to view it.'
+            );
+        }
+    }
+
+} catch (Throwable $e) {
+    error_log('Payroll loading error: ' . $e->getMessage());
+
+    $payrollError = $e instanceof RuntimeException
+        ? $e->getMessage()
+        : 'Payroll information could not be loaded. Please try again later.';
 }
-
-$pageUrl = static function (int $targetPage) use ($isEmployee, $search, $periodFrom, $periodTo, $statusFilter): string {
-    return 'payroll.php?' . http_build_query([
-        'search' => $isEmployee ? null : $search,
-        'period_from' => $periodFrom,
-        'period_to' => $periodTo,
-        'status' => $statusFilter,
-        'page' => $targetPage,
-    ]);
-};
 
 require __DIR__ . '/includes/header.php';
 require __DIR__ . '/includes/sidebar.php';
 ?>
-<section class="page-heading">
-    <div>
-        <p class="eyebrow"><?= $isEmployee ? 'MY WORKSPACE' : 'WORKSPACE' ?></p>
-        <h1><?= $isEmployee ? 'My payroll' : 'Payroll' ?></h1>
-        <p class="page-description"><?= $isEmployee ? 'Your payroll history and payslips.' : 'Generate payroll and review payment history.' ?></p>
-    </div>
-</section>
-<?php if ($notice !== null): ?>
-    <div class="alert <?= ($notice['type'] ?? '') === 'success' ? 'alert-success' : 'alert-error' ?>" role="status"><?= $escape($notice['message'] ?? '') ?></div>
-<?php endif; ?>
-<?php if ($errorMessage !== null): ?>
-    <div class="alert alert-error" role="alert"><?= $escape($errorMessage) ?></div>
-<?php endif; ?>
 
-<?php if (!$isEmployee && $errorMessage === null): ?>
-    <section class="panel employee-panel payroll-generation-panel">
-        <div class="panel-heading"><div><h2>Generate payroll</h2><p>Each employee can have only one record for an exact pay-period start and end date.</p></div></div>
-        <form class="employee-form" method="post" action="payroll.php">
-            <input type="hidden" name="csrf_token" value="<?= $escape(auth_csrf_token()) ?>">
-            <input type="hidden" name="action" value="generate">
-            <div class="form-grid">
-                <div class="form-field payroll-employee-field">
-                    <label for="employee_id">Employee</label>
-                    <select id="employee_id" name="employee_id" required>
-                        <option value="">Select an employee</option>
-                        <?php foreach ($employees as $employee): ?>
-                            <option value="<?= (int) $employee['employee_id'] ?>" <?= (string) $formValues['employee_id'] === (string) $employee['employee_id'] ? 'selected' : '' ?>><?= $escape($employee['employee_code'] . ' · ' . $employee['first_name'] . ' ' . $employee['last_name']) ?></option>
-                        <?php endforeach; ?>
+<style>
+.payroll-page {
+    display: flex;
+    flex-direction: column;
+    gap: 26px;
+}
+
+.payroll-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.payroll-heading h1 {
+    color: var(--text);
+    font-size: 30px;
+    font-weight: 750;
+    margin: 5px 0;
+    letter-spacing: -.8px;
+}
+
+.payroll-heading .eyebrow {
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 2px;
+}
+
+.payroll-heading .page-description {
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.payroll-date {
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    color: var(--text);
+    padding: 12px 17px;
+    font-size: 13px;
+}
+
+.payroll-alert {
+    padding: 15px 18px;
+    border-radius: 12px;
+    font-size: 13px;
+}
+
+.payroll-alert.success {
+    background: rgba(99,214,162,.10);
+    color: var(--green);
+    border: 1px solid rgba(99,214,162,.25);
+}
+
+.payroll-alert.error {
+    background: rgba(255,105,125,.10);
+    color: #ff8d9c;
+    border: 1px solid rgba(255,105,125,.25);
+}
+
+.payroll-stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.payroll-stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 21px;
+    min-width: 0;
+    transition: .2s ease;
+}
+
+.payroll-stat:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent);
+}
+
+.payroll-stat-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.payroll-stat-label {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.payroll-stat-icon {
+    width: 37px;
+    height: 37px;
+    border-radius: 11px;
+    display: grid;
+    place-items: center;
+    background: rgba(156,140,255,.14);
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.payroll-stat-value {
+    color: var(--text);
+    font-size: 25px;
+    font-weight: 750;
+    margin: 18px 0 5px;
+    overflow-wrap: anywhere;
+}
+
+.payroll-stat-note {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.payroll-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    min-width: 0;
+}
+
+.payroll-card-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 15px;
+    margin-bottom: 22px;
+}
+
+.payroll-card-heading h2 {
+    color: var(--text);
+    font-size: 17px;
+    font-weight: 700;
+    margin: 0 0 6px;
+}
+
+.payroll-card-heading p {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 0;
+}
+
+.payroll-form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1.4fr auto;
+    align-items: end;
+    gap: 15px;
+}
+
+.payroll-field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+.payroll-field label {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.payroll-field input,
+.payroll-field select {
+    width: 100%;
+    min-width: 0;
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    padding: 12px 13px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+}
+
+.payroll-field input:focus,
+.payroll-field select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(156,140,255,.12);
+}
+
+.payroll-button {
+    border: 0;
+    border-radius: 10px;
+    padding: 12px 19px;
+    background: var(--accent);
+    color: #171323;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 750;
+    cursor: pointer;
+    transition: .2s ease;
+}
+
+.payroll-button:hover {
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+}
+
+.payroll-button.secondary {
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+
+.payroll-button.paid-button {
+    background: rgba(99,214,162,.14);
+    color: var(--green);
+    border: 1px solid rgba(99,214,162,.25);
+}
+
+.payroll-hint {
+    margin-top: 17px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+.payroll-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.payroll-table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 1250px;
+}
+
+.payroll-table th {
+    text-align: left;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 750;
+    padding: 14px 13px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.payroll-table td {
+    padding: 16px 13px;
+    color: var(--text);
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.payroll-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.payroll-table tbody tr:hover {
+    background: rgba(156,140,255,.035);
+}
+
+.payroll-person {
+    display: block;
+    color: var(--text);
+    font-weight: 700;
+    margin-bottom: 5px;
+}
+
+.payroll-secondary {
+    display: block;
+    color: var(--muted);
+    font-size: 10px;
+}
+
+.payroll-status {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 30px;
+    padding: 6px 10px;
+    font-size: 10px;
+    font-weight: 750;
+}
+
+.payroll-status.pending {
+    background: rgba(255,190,92,.12);
+    color: #ffc46d;
+}
+
+.payroll-status.paid {
+    background: rgba(99,214,162,.12);
+    color: var(--green);
+}
+
+.payroll-link {
+    display: inline-block;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 11px;
+    font-weight: 700;
+    margin-right: 10px;
+}
+
+.payroll-link:hover {
+    text-decoration: underline;
+}
+
+.payroll-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    min-width: 210px;
+}
+
+.payroll-adjustment {
+    padding: 14px;
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+
+.payroll-adjustment h3 {
+    color: var(--text);
+    font-size: 12px;
+    margin: 0 0 12px;
+}
+
+.payroll-adjustment .payroll-field {
+    margin-bottom: 11px;
+}
+
+.payroll-adjustment .payroll-button {
+    width: 100%;
+}
+
+.payroll-empty {
+    text-align: center;
+    color: var(--muted) !important;
+    padding: 35px 15px !important;
+}
+
+.payroll-detail {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 23px;
+    background: var(--panel-raised);
+}
+
+.payroll-detail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 15px;
+    margin-bottom: 25px;
+}
+
+.payroll-detail-header h2 {
+    color: var(--text);
+    font-size: 19px;
+    margin: 0 0 5px;
+}
+
+.payroll-detail-header p {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 0;
+}
+
+.payroll-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 20px;
+    margin-bottom: 25px;
+}
+
+.payroll-detail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.payroll-detail-item span {
+    color: var(--muted);
+    font-size: 10px;
+}
+
+.payroll-detail-item strong {
+    color: var(--text);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.payroll-breakdown {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.payroll-breakdown th,
+.payroll-breakdown td {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 10px;
+    font-size: 12px;
+}
+
+.payroll-breakdown th {
+    text-align: left;
+    color: var(--muted);
+    font-weight: 550;
+}
+
+.payroll-breakdown td {
+    text-align: right;
+    color: var(--text);
+    font-weight: 650;
+}
+
+.payroll-breakdown tr:last-child th,
+.payroll-breakdown tr:last-child td {
+    border-bottom: none;
+}
+
+.payroll-breakdown .net-row th,
+.payroll-breakdown .net-row td {
+    color: var(--accent);
+    font-size: 15px;
+    font-weight: 800;
+}
+
+.payroll-record-heading {
+    margin-bottom: 20px;
+}
+
+.payroll-record-heading h2 {
+    color: var(--text);
+    font-size: 17px;
+    margin: 0 0 5px;
+}
+
+.payroll-record-heading p {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 0;
+}
+
+@media (max-width: 1100px) {
+    .payroll-stat-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .payroll-form-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 650px) {
+    .payroll-stat-grid,
+    .payroll-form-grid,
+    .payroll-detail-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .payroll-card {
+        padding: 17px;
+    }
+
+    .payroll-heading h1 {
+        font-size: 24px;
+    }
+
+    .payroll-detail {
+        padding: 16px;
+    }
+}
+</style>
+
+<div class="payroll-page">
+
+    <!-- PAGE HEADER -->
+
+    <section class="payroll-heading">
+        <div>
+            <p class="eyebrow">
+                <?= $isAdmin ? 'COMPENSATION' : 'EMPLOYEE SELF-SERVICE' ?>
+            </p>
+
+            <h1>
+                <?= $isAdmin ? 'Payroll Management' : 'My Payroll' ?>
+            </h1>
+
+            <p class="page-description">
+                <?= $isAdmin
+                    ? 'Manage employee salaries, payroll periods, deductions, and payments.'
+                    : 'View your salary records, allowances, overtime, deductions, and payment history.' ?>
+            </p>
+        </div>
+
+        <div class="payroll-date">
+            <?= payroll_escape(date('l, F j, Y')) ?>
+        </div>
+    </section>
+
+    <?php if ($successMessage !== null): ?>
+        <div class="payroll-alert success" role="status">
+            <?= payroll_escape($successMessage) ?>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($payrollError !== null): ?>
+        <div class="payroll-alert error" role="alert">
+            <?= payroll_escape($payrollError) ?>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($isAdmin): ?>
+
+        <!-- PAYROLL STATISTICS -->
+
+        <section class="payroll-stat-grid">
+
+            <article class="payroll-stat">
+                <div class="payroll-stat-top">
+                    <span class="payroll-stat-label">Payroll records</span>
+                    <span class="payroll-stat-icon">PR</span>
+                </div>
+                <p class="payroll-stat-value">
+                    <?= number_format((int)$payrollStats['total']) ?>
+                </p>
+                <span class="payroll-stat-note">Total generated records</span>
+            </article>
+
+            <article class="payroll-stat">
+                <div class="payroll-stat-top">
+                    <span class="payroll-stat-label">Pending payments</span>
+                    <span class="payroll-stat-icon">PD</span>
+                </div>
+                <p class="payroll-stat-value">
+                    <?= number_format((int)$payrollStats['pending']) ?>
+                </p>
+                <span class="payroll-stat-note">Awaiting payment</span>
+            </article>
+
+            <article class="payroll-stat">
+                <div class="payroll-stat-top">
+                    <span class="payroll-stat-label">Paid records</span>
+                    <span class="payroll-stat-icon">PA</span>
+                </div>
+                <p class="payroll-stat-value">
+                    <?= number_format((int)$payrollStats['paid']) ?>
+                </p>
+                <span class="payroll-stat-note">Successfully paid</span>
+            </article>
+
+            <article class="payroll-stat">
+                <div class="payroll-stat-top">
+                    <span class="payroll-stat-label">Total net payroll</span>
+                    <span class="payroll-stat-icon">₱</span>
+                </div>
+                <p class="payroll-stat-value">
+                    <?= payroll_money($payrollStats['total_amount']) ?>
+                </p>
+                <span class="payroll-stat-note">All generated payroll records</span>
+            </article>
+
+        </section>
+
+        <!-- GENERATE PAYROLL -->
+
+        <section class="payroll-card">
+            <div class="payroll-card-heading">
+                <div>
+                    <h2>Generate payroll</h2>
+                    <p>Create salary records for the selected semi-monthly cutoff.</p>
+                </div>
+            </div>
+
+            <form method="post" class="payroll-form-grid">
+                <input type="hidden" name="csrf_token"
+                       value="<?= payroll_escape($csrfToken) ?>">
+                <input type="hidden" name="action" value="generate">
+
+                <div class="payroll-field">
+                    <label for="month">Payroll month</label>
+                    <select name="month" id="month" required>
+                        <?php for ($m = 1; $m <= 12; $m++): ?>
+                            <option value="<?= $m ?>"
+                                <?= $m === (int)date('n') ? 'selected' : '' ?>>
+                                <?= date('F', mktime(0, 0, 0, $m, 1)) ?>
+                            </option>
+                        <?php endfor; ?>
                     </select>
                 </div>
-                <div class="form-field"><label for="pay_period_start">Pay period start</label><input id="pay_period_start" name="pay_period_start" type="date" value="<?= $escape($formValues['pay_period_start']) ?>" required></div>
-                <div class="form-field"><label for="pay_period_end">Pay period end</label><input id="pay_period_end" name="pay_period_end" type="date" value="<?= $escape($formValues['pay_period_end']) ?>" required></div>
-                <div class="form-field"><label for="basic_salary">Basic salary</label><input id="basic_salary" name="basic_salary" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($formValues['basic_salary']) ?>" required></div>
-                <div class="form-field"><label for="allowances">Allowances</label><input id="allowances" name="allowances" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($formValues['allowances']) ?>" required></div>
-                <div class="form-field"><label for="overtime_pay">Overtime pay</label><input id="overtime_pay" name="overtime_pay" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($formValues['overtime_pay']) ?>" required></div>
-                <div class="form-field"><label for="deductions">Deductions</label><input id="deductions" name="deductions" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($formValues['deductions']) ?>" required></div>
-            </div>
-            <p class="form-help">Gross = basic salary + allowances + overtime. Net = gross − deductions. Values are calculated in cents and stored in the existing DECIMAL columns.</p>
-            <div class="form-actions"><button class="button button-primary" type="submit">Generate payroll</button></div>
-        </form>
-    </section>
-<?php endif; ?>
 
-<?php if ($errorMessage === null): ?>
-    <section class="panel employee-panel payroll-list-panel">
-        <form class="employee-filters payroll-filters" method="get" action="payroll.php">
-            <?php if (!$isEmployee): ?>
-                <div class="search-field"><label class="visually-hidden" for="payroll-search">Search employees</label><input id="payroll-search" name="search" type="search" value="<?= $escape($search) ?>" placeholder="Search name, employee ID, or code"></div>
-            <?php endif; ?>
-            <div class="filter-field"><label class="visually-hidden" for="period-from">Period overlaps from</label><input id="period-from" name="period_from" type="date" value="<?= $escape($periodFrom) ?>"></div>
-            <div class="filter-field"><label class="visually-hidden" for="period-to">Period overlaps through</label><input id="period-to" name="period_to" type="date" value="<?= $escape($periodTo) ?>"></div>
-            <div class="filter-field"><label class="visually-hidden" for="payment-status">Payment status</label><select id="payment-status" name="status"><option value="">All statuses</option><option value="Pending" <?= $statusFilter === 'Pending' ? 'selected' : '' ?>>Pending</option><option value="Paid" <?= $statusFilter === 'Paid' ? 'selected' : '' ?>>Paid</option></select></div>
-            <button class="button button-secondary" type="submit">Filter</button>
-            <?php if ($search !== '' || $periodFrom !== '' || $periodTo !== '' || $statusFilter !== ''): ?><a class="button button-quiet" href="payroll.php">Clear</a><?php endif; ?>
-        </form>
-        <div class="table-wrap">
-            <table class="employee-table payroll-table">
-                <thead><tr>
-                    <th scope="col">Payroll ID</th><?php if (!$isEmployee): ?><th scope="col">Employee</th><th scope="col">Department</th><?php endif; ?>
-                    <th scope="col">Pay period</th><th scope="col">Basic salary</th><th scope="col">Allowances</th><th scope="col">Overtime</th><th scope="col">Deductions</th><th scope="col">Gross</th><th scope="col">Net</th><th scope="col">Status</th><th scope="col">Payment date</th><th scope="col">Details</th>
-                </tr></thead>
+                <div class="payroll-field">
+                    <label for="year">Year</label>
+                    <input type="number" name="year" id="year"
+                           min="2000" max="2100"
+                           value="<?= date('Y') ?>" required>
+                </div>
+
+                <div class="payroll-field">
+                    <label for="cutoff">Cutoff period</label>
+                    <select name="cutoff" id="cutoff" required>
+                        <option value="first">First cutoff · 1–15</option>
+                        <option value="second">Second cutoff · 16–End of month</option>
+                    </select>
+                </div>
+
+                <button type="submit" class="payroll-button">
+                    Generate payroll
+                </button>
+            </form>
+
+            <p class="payroll-hint">
+                The employee's monthly basic salary is divided by two.
+                Duplicate payroll records are skipped.
+                After generation, enter Allowances, Overtime, and Deductions
+                in the Payroll Records section below.
+            </p>
+        </section>
+
+    <?php endif; ?>
+
+    <!-- SELECTED PAYSLIP DETAILS -->
+
+    <?php if ($selectedPayroll !== null): ?>
+
+        <section class="payroll-card">
+
+            <div class="payroll-card-heading">
+                <div>
+                    <h2>Payslip details</h2>
+                    <p>Complete salary breakdown and payment information.</p>
+                </div>
+
+                <a class="payroll-link" href="payroll.php">
+                    Back to records
+                </a>
+            </div>
+
+            <div class="payroll-detail">
+
+                <div class="payroll-detail-header">
+                    <div>
+                        <h2>PeopleSuite</h2>
+                        <p>Employee payslip</p>
+                    </div>
+
+                    <span class="payroll-status <?= strtolower(payroll_escape($selectedPayroll['payment_status'])) ?>">
+                        <?= payroll_escape($selectedPayroll['payment_status']) ?>
+                    </span>
+                </div>
+
+                <div class="payroll-detail-grid">
+
+                    <div class="payroll-detail-item">
+                        <span>Employee name</span>
+                        <strong>
+                            <?= payroll_escape(
+                                $selectedPayroll['first_name'] . ' ' .
+                                $selectedPayroll['last_name']
+                            ) ?>
+                        </strong>
+                    </div>
+
+                    <div class="payroll-detail-item">
+                        <span>Employee code</span>
+                        <strong>
+                            <?= payroll_escape($selectedPayroll['employee_code']) ?>
+                        </strong>
+                    </div>
+
+                    <div class="payroll-detail-item">
+                        <span>Department</span>
+                        <strong>
+                            <?= payroll_escape(
+                                $selectedPayroll['department_name'] ?? 'Unassigned'
+                            ) ?>
+                        </strong>
+                    </div>
+
+                    <div class="payroll-detail-item">
+                        <span>Position</span>
+                        <strong>
+                            <?= payroll_escape($selectedPayroll['position'] ?? '—') ?>
+                        </strong>
+                    </div>
+
+                    <div class="payroll-detail-item">
+                        <span>Pay period</span>
+                        <strong>
+                            <?= payroll_escape(date(
+                                'M j, Y',
+                                strtotime($selectedPayroll['pay_period_start'])
+                            )) ?>
+                            –
+                            <?= payroll_escape(date(
+                                'M j, Y',
+                                strtotime($selectedPayroll['pay_period_end'])
+                            )) ?>
+                        </strong>
+                    </div>
+
+                    <div class="payroll-detail-item">
+                        <span>Payment date</span>
+                        <strong>
+                            <?= !empty($selectedPayroll['payment_date'])
+                                ? payroll_escape(date(
+                                    'M j, Y',
+                                    strtotime($selectedPayroll['payment_date'])
+                                ))
+                                : 'Not yet paid' ?>
+                        </strong>
+                    </div>
+
+                </div>
+
+                <!-- COMPLETE SALARY BREAKDOWN -->
+
+                <table class="payroll-breakdown">
+                    <tbody>
+
+                        <tr>
+                            <th>Basic salary</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['basic_salary']) ?>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th>Allowances</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['allowances']) ?>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th>Overtime pay</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['overtime_pay']) ?>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th>Gross salary</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['gross_salary']) ?>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th>Deductions</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['deductions']) ?>
+                            </td>
+                        </tr>
+
+                        <tr class="net-row">
+                            <th>Net salary</th>
+                            <td>
+                                <?= payroll_money($selectedPayroll['net_salary']) ?>
+                            </td>
+                        </tr>
+
+                    </tbody>
+                </table>
+
+            </div>
+        </section>
+
+    <?php endif; ?>
+
+    <!-- PAYROLL RECORDS -->
+
+    <section class="payroll-card">
+
+        <div class="payroll-record-heading">
+            <h2><?= $isAdmin ? 'Payroll records' : 'My payslips' ?></h2>
+
+            <p>
+                <?= $isAdmin
+                    ? 'Enter payroll adjustments and deductions for each pending employee record.'
+                    : 'Your salary, allowances, overtime, deductions, and payment history.' ?>
+            </p>
+        </div>
+
+        <div class="payroll-table-wrap">
+
+            <table class="payroll-table">
+
+                <thead>
+                    <tr>
+
+                        <?php if ($isAdmin): ?>
+                            <th>Employee</th>
+                            <th>Department</th>
+                        <?php endif; ?>
+
+                        <th>Pay period</th>
+                        <th>Basic salary</th>
+                        <th>Allowances</th>
+                        <th>Overtime pay</th>
+                        <th>Gross salary</th>
+                        <th>Deductions</th>
+                        <th>Net salary</th>
+                        <th>Status</th>
+                        <th>Payment date</th>
+                        <th>Actions / Adjustments</th>
+
+                    </tr>
+                </thead>
+
                 <tbody>
-                    <?php if ($records === []): ?>
-                        <tr><td class="empty-state" colspan="<?= $isEmployee ? 11 : 13 ?>"><?= $isEmployee ? 'No payroll records are available.' : 'No payroll records match these filters.' ?></td></tr>
+
+                    <?php if ($payrollRecords === []): ?>
+
+                        <tr>
+                            <td colspan="<?= $isAdmin ? 12 : 10 ?>"
+                                class="payroll-empty">
+                                No payroll records found.
+                            </td>
+                        </tr>
+
                     <?php else: ?>
-                        <?php foreach ($records as $record): ?>
+
+                        <?php foreach ($payrollRecords as $record): ?>
+
                             <tr>
-                                <td>#<?= (int) $record['payroll_id'] ?></td>
-                                <?php if (!$isEmployee): ?><td><span class="person-name"><?= $escape($record['first_name'] . ' ' . $record['last_name']) ?></span><span class="secondary-text">ID <?= (int) $record['employee_id'] ?> · <?= $escape($record['employee_code']) ?></span></td><td><?= $escape($record['department_name'] ?? 'Unassigned') ?></td><?php endif; ?>
-                                <td><?= $escape(date('M j', strtotime($record['pay_period_start']))) ?> – <?= $escape(date('M j, Y', strtotime($record['pay_period_end']))) ?></td>
-                                <td><?= $escape($displayMoney($record['basic_salary'])) ?></td><td><?= $escape($displayMoney($record['allowances'])) ?></td><td><?= $escape($displayMoney($record['overtime_pay'])) ?></td><td><?= $escape($displayMoney($record['deductions'])) ?></td><td><?= $escape($displayMoney($record['gross_salary'])) ?></td><td><?= $escape($displayMoney($record['net_salary'])) ?></td>
-                                <td><span class="status-badge payment-status-<?= $escape(strtolower($record['payment_status'])) ?>"><?= $escape($record['payment_status']) ?></span></td>
-                                <td><?= $record['payment_date'] !== null ? $escape(date('M j, Y', strtotime($record['payment_date']))) : '—' ?></td>
-                                <td><a class="action-link" href="payroll-details.php?id=<?= (int) $record['payroll_id'] ?>">View</a><?php if ($isEmployee): ?> · <a class="action-link" href="payslip.php?id=<?= (int) $record['payroll_id'] ?>">Payslip</a><?php endif; ?></td>
+
+                                <?php if ($isAdmin): ?>
+
+                                    <td>
+                                        <span class="payroll-person">
+                                            <?= payroll_escape(
+                                                $record['first_name'] . ' ' .
+                                                $record['last_name']
+                                            ) ?>
+                                        </span>
+
+                                        <span class="payroll-secondary">
+                                            <?= payroll_escape($record['employee_code']) ?>
+                                        </span>
+                                    </td>
+
+                                    <td>
+                                        <?= payroll_escape(
+                                            $record['department_name'] ?? 'Unassigned'
+                                        ) ?>
+                                    </td>
+
+                                <?php endif; ?>
+
+                                <td>
+                                    <?= payroll_escape(date(
+                                        'M j',
+                                        strtotime($record['pay_period_start'])
+                                    )) ?>
+                                    –
+                                    <?= payroll_escape(date(
+                                        'M j, Y',
+                                        strtotime($record['pay_period_end'])
+                                    )) ?>
+                                </td>
+
+                                <td>
+                                    <?= payroll_money($record['basic_salary']) ?>
+                                </td>
+
+                                <td>
+                                    <?= payroll_money($record['allowances']) ?>
+                                </td>
+
+                                <td>
+                                    <?= payroll_money($record['overtime_pay']) ?>
+                                </td>
+
+                                <td>
+                                    <?= payroll_money($record['gross_salary']) ?>
+                                </td>
+
+                                <td>
+                                    <strong>
+                                        <?= payroll_money($record['deductions']) ?>
+                                    </strong>
+                                </td>
+
+                                <td>
+                                    <strong>
+                                        <?= payroll_money($record['net_salary']) ?>
+                                    </strong>
+                                </td>
+
+                                <td>
+                                    <span class="payroll-status <?= strtolower(payroll_escape($record['payment_status'])) ?>">
+                                        <?= payroll_escape($record['payment_status']) ?>
+                                    </span>
+                                </td>
+
+                                <td>
+                                    <?= !empty($record['payment_date'])
+                                        ? payroll_escape(date(
+                                            'M j, Y',
+                                            strtotime($record['payment_date'])
+                                        ))
+                                        : '—' ?>
+                                </td>
+
+                                <td>
+
+                                    <div class="payroll-actions">
+
+                                        <!-- VIEW PAYSLIP FOR BOTH ADMIN AND EMPLOYEE -->
+
+                                        <a class="payroll-link"
+                                           href="payroll.php?view=<?= (int)$record['payroll_id'] ?>">
+                                            View payslip
+                                        </a>
+
+                                        <?php if (
+                                            $isAdmin &&
+                                            $record['payment_status'] === 'Pending'
+                                        ): ?>
+
+                                            <!-- ADMIN PAYROLL ADJUSTMENTS -->
+
+                                            <div class="payroll-adjustment">
+
+                                                <h3>Payroll adjustments</h3>
+
+                                                <form method="post">
+
+                                                    <input type="hidden"
+                                                           name="csrf_token"
+                                                           value="<?= payroll_escape($csrfToken) ?>">
+
+                                                    <input type="hidden"
+                                                           name="action"
+                                                           value="update_amounts">
+
+                                                    <input type="hidden"
+                                                           name="payroll_id"
+                                                           value="<?= (int)$record['payroll_id'] ?>">
+
+                                                    <div class="payroll-field">
+                                                        <label>
+                                                            Allowances (₱)
+                                                        </label>
+
+                                                        <input type="number"
+                                                               name="allowances"
+                                                               min="0"
+                                                               step="0.01"
+                                                               value="<?= payroll_escape($record['allowances']) ?>"
+                                                               required>
+                                                    </div>
+
+                                                    <div class="payroll-field">
+                                                        <label>
+                                                            Overtime pay (₱)
+                                                        </label>
+
+                                                        <input type="number"
+                                                               name="overtime_pay"
+                                                               min="0"
+                                                               step="0.01"
+                                                               value="<?= payroll_escape($record['overtime_pay']) ?>"
+                                                               required>
+                                                    </div>
+
+                                                    <div class="payroll-field">
+                                                        <label>
+                                                            Deductions (₱)
+                                                        </label>
+
+                                                        <input type="number"
+                                                               name="deductions"
+                                                               min="0"
+                                                               step="0.01"
+                                                               value="<?= payroll_escape($record['deductions']) ?>"
+                                                               required>
+                                                    </div>
+
+                                                    <button type="submit"
+                                                            class="payroll-button">
+                                                        Save payroll amounts
+                                                    </button>
+
+                                                </form>
+
+                                            </div>
+
+                                            <!-- MARK AS PAID -->
+
+                                            <form method="post"
+                                                  onsubmit="return confirm('Are you sure you want to mark this payroll as paid?');">
+
+                                                <input type="hidden"
+                                                       name="csrf_token"
+                                                       value="<?= payroll_escape($csrfToken) ?>">
+
+                                                <input type="hidden"
+                                                       name="action"
+                                                       value="mark_paid">
+
+                                                <input type="hidden"
+                                                       name="payroll_id"
+                                                       value="<?= (int)$record['payroll_id'] ?>">
+
+                                                <button type="submit"
+                                                        class="payroll-button paid-button">
+                                                    Mark paid
+                                                </button>
+
+                                            </form>
+
+                                        <?php endif; ?>
+
+                                    </div>
+
+                                </td>
+
                             </tr>
+
                         <?php endforeach; ?>
+
                     <?php endif; ?>
+
                 </tbody>
+
             </table>
+
         </div>
-        <div class="listing-footer">
-            <p><?= number_format($totalRecords) ?> record<?= $totalRecords === 1 ? '' : 's' ?><?= $totalRecords > 0 ? ' · Page ' . $page . ' of ' . $totalPages : '' ?></p>
-            <?php if ($totalPages > 1): ?><nav class="pagination" aria-label="Payroll pages"><?php if ($page > 1): ?><a class="button button-quiet" href="<?= $escape($pageUrl($page - 1)) ?>">Previous</a><?php endif; ?><?php if ($page < $totalPages): ?><a class="button button-quiet" href="<?= $escape($pageUrl($page + 1)) ?>">Next</a><?php endif; ?></nav><?php endif; ?>
-        </div>
+
     </section>
-<?php endif; ?>
+
+</div>
+
 <?php require __DIR__ . '/includes/footer.php'; ?>

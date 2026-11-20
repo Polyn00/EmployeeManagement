@@ -18,12 +18,12 @@
         <?php elseif ($currentUser['role'] === 'Employee'): ?>
             <a class="nav-link <?= $activePage === 'my-account' ? 'is-active' : '' ?>" href="my-account.php" <?= $activePage === 'my-account' ? 'aria-current="page"' : '' ?>>
                 <span class="nav-icon" aria-hidden="true">ME</span>
-                <span>My account</span>
+                <span>Profile</span>
             </a>
-            <a class="nav-link <?= $activePage === 'attendance' ? 'is-active' : '' ?>" href="attendance.php" <?= $activePage === 'attendance' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">AT</span><span>My attendance</span></a>
-            <a class="nav-link <?= $activePage === 'leave' ? 'is-active' : '' ?>" href="leave.php" <?= $activePage === 'leave' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">LV</span><span>My leave</span></a>
-            <a class="nav-link <?= $activePage === 'payroll' ? 'is-active' : '' ?>" href="payroll.php" <?= $activePage === 'payroll' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">PY</span><span>My payroll</span></a>
-            <a class="nav-link <?= $activePage === 'performance' ? 'is-active' : '' ?>" href="performance.php" <?= $activePage === 'performance' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">PR</span><span>My performance</span></a>
+            <a class="nav-link <?= $activePage === 'attendance' ? 'is-active' : '' ?>" href="attendance.php" <?= $activePage === 'attendance' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">AT</span><span>Attendance</span></a>
+            <a class="nav-link <?= $activePage === 'leave' ? 'is-active' : '' ?>" href="leave.php" <?= $activePage === 'leave' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">LV</span><span>Leave Request</span></a>
+            <a class="nav-link <?= $activePage === 'payroll' ? 'is-active' : '' ?>" href="payroll.php" <?= $activePage === 'payroll' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">PY</span><span>View Payroll</span></a>
+            <a class="nav-link <?= $activePage === 'performance' ? 'is-active' : '' ?>" href="performance.php" <?= $activePage === 'performance' ? 'aria-current="page"' : '' ?>><span class="nav-icon" aria-hidden="true">PR</span><span>Performane Overview</span></a>
         <?php else: ?>
             <a class="nav-link <?= $activePage === 'dashboard' ? 'is-active' : '' ?>" href="dashboard.php" <?= $activePage === 'dashboard' ? 'aria-current="page"' : '' ?>>
                 <span class="nav-icon" aria-hidden="true">OV</span>
