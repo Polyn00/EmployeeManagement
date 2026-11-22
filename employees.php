@@ -16,69 +16,15 @@ $search = isset($_GET['search']) && is_string($_GET['search']) ? trim($_GET['sea
 $search = substr($search, 0, 100);
 $status = isset($_GET['status']) && is_string($_GET['status']) ? $_GET['status'] : '';
 $statuses = ['Active', 'On Leave', 'Resigned', 'Terminated', 'Retired'];
+
 if (!in_array($status, $statuses, true)) {
     $status = '';
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $returnQuery = http_build_query([
-        'search' => $search,
-        'status' => $status,
-        'page' => isset($_GET['page']) && is_scalar($_GET['page']) ? (string) $_GET['page'] : '',
-    ]);
-    $returnUrl = 'employees.php' . ($returnQuery !== '' ? '?' . $returnQuery : '');
-
-    if (!employee_csrf_is_valid($_POST['csrf_token'] ?? null)) {
-        employee_set_notice('error', 'Your session expired. Please try again.');
-        header('Location: ' . $returnUrl);
-        exit;
-    }
-
-    $employeeId = filter_var($_POST['employee_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-    if ($employeeId === false) {
-        employee_set_notice('error', 'The employee could not be found.');
-        header('Location: ' . $returnUrl);
-        exit;
-    }
-
-    try {
-        $pdo->beginTransaction();
-        $lookup = $pdo->prepare('SELECT employee_code FROM employees WHERE employee_id = :employee_id FOR UPDATE');
-        $lookup->execute([':employee_id' => $employeeId]);
-        $employeeCode = $lookup->fetchColumn();
-        $delete = $pdo->prepare('DELETE FROM employees WHERE employee_id = :employee_id');
-        $delete->execute([':employee_id' => $employeeId]);
-        $deleted = $delete->rowCount() === 1;
-        if ($deleted) {
-            audit_record(
-                $pdo,
-                'employee_deleted',
-                'employee',
-                (int) $employeeId,
-                ['employee_code' => (string) $employeeCode],
-                (int) auth_current_user()['user_id']
-            );
-        }
-        $pdo->commit();
-        employee_set_notice(
-            $deleted ? 'success' : 'error',
-            $deleted ? 'Employee deleted successfully.' : 'The employee could not be found.'
-        );
-    } catch (PDOException $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
-        error_log('Employee delete failed: ' . $e->getMessage());
-        employee_set_notice('error', 'The employee could not be deleted. Please try again.');
-    }
-
-    header('Location: ' . $returnUrl);
-    exit;
 }
 
 $page = isset($_GET['page']) && is_scalar($_GET['page'])
     ? filter_var($_GET['page'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
     : 1;
+
 $page = $page === false ? 1 : $page;
 
 try {

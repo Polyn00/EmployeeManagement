@@ -1121,13 +1121,13 @@ tbody tr:last-child td {
 }
 
 .button-primary {
-    border-color: rgba(190, 177, 255, 0.24);
-    background: linear-gradient(145deg, #9581f2, #7664d9);
+    border-color: rgba(99, 214, 162, 0.28);
+    background: linear-gradient(145deg, #38b981, #249966);
     color: #fff;
 }
 
 .button-primary:hover {
-    background: linear-gradient(145deg, #a18eff, #8572e9);
+    background: linear-gradient(145deg, #49ca91, #2eaa76);
 }
 
 .button-primary:disabled {
@@ -1176,7 +1176,7 @@ tbody tr:last-child td {
     padding: 0;
     border: 0;
     background: none;
-    color: #b3a7ff;
+    color: #63d6a2;
     cursor: pointer;
     font: inherit;
     font-size: 11px;
@@ -1184,7 +1184,7 @@ tbody tr:last-child td {
 }
 
 .action-link:hover {
-    color: #d3cbff;
+    color: #91e5bd;
 }
 
 .action-danger {
@@ -1268,10 +1268,10 @@ tbody tr:last-child td {
     border-top: 1px solid var(--border);
 }
 
-.alert-success {
+-success {
     margin: 0 0 15px;
-    border-color: rgba(99, 214, 162, 0.24);
-    background: rgba(99, 214, 162, 0.08);
+    border-color: rgba(99, 214, 162, 0.28);
+    background: rgba(99, 214, 162, 0.10);
     color: #91e5bd;
 }
 
@@ -1564,4 +1564,42 @@ tbody tr:last-child td {
         color: #111;
         background: #e8f4ec !important;
     }
+}
+
+/* =================================
+   SUCCESS THEME - GREEN
+================================= */
+
+/* Success alerts */
+.alert-success {
+    border-color: rgba(99, 214, 162, 0.28);
+    background: rgba(99, 214, 162, 0.10);
+    color: #91e5bd;
+}
+
+/* Success badges */
+.status-badge,
+.payment-status-paid,
+.leave-status-approved {
+    border-color: rgba(99, 214, 162, 0.2);
+    background: rgba(99, 214, 162, 0.08);
+    color: #83ddb4;
+}
+
+/* Success icons */
+.icon-green {
+    border-color: rgba(99, 214, 162, 0.2);
+    background: rgba(99, 214, 162, 0.1);
+    color: #82e2b6;
+}
+
+/* Success buttons */
+.button-success {
+    border: 1px solid rgba(99, 214, 162, 0.28);
+    background: linear-gradient(145deg, #38b981, #249966);
+    color: #fff;
+}
+
+.button-success:hover {
+    background: linear-gradient(145deg, #49ca91, #2eaa76);
 }
