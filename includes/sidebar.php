@@ -45,6 +45,12 @@
                 <span class="nav-icon" aria-hidden="true">LV</span>
                 <span>Leave requests</span>
             </a>
+            <?php if ($currentUser['role'] === 'HR'): ?>
+                <a class="nav-link <?= $activePage === 'payroll' ? 'is-active' : '' ?>" href="payroll.php" <?= $activePage === 'payroll' ? 'aria-current="page"' : '' ?>>
+                    <span class="nav-icon" aria-hidden="true">PY</span>
+                    <span>Payroll</span>
+                </a>
+            <?php endif; ?>
             <a class="nav-link <?= $activePage === 'reports' ? 'is-active' : '' ?>" href="reports.php" <?= $activePage === 'reports' ? 'aria-current="page"' : '' ?>>
                 <span class="nav-icon" aria-hidden="true">RP</span>
                 <span>Reports</span>

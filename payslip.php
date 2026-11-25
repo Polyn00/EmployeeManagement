@@ -1,7 +1,8 @@
 <?php
 require __DIR__ . '/includes/auth.php';
-auth_require_roles(['Admin', 'Employee']);
+auth_require_roles(['Admin', 'HR', 'Employee']);
 require __DIR__ . '/config/db.php';
+require __DIR__ . '/includes/payroll_helpers.php';
 
 $user = auth_current_user();
 $isEmployee = $user['role'] === 'Employee';
@@ -19,6 +20,7 @@ if ($payrollId === false || ($isEmployee && $employeeId === false)) {
     try {
         $sql = 'SELECT p.payroll_id, p.pay_period_start, p.pay_period_end,
                        p.basic_salary, p.allowances, p.overtime_pay, p.deductions,
+                       p.sss_deduction, p.philhealth_deduction, p.pagibig_deduction,
                        p.gross_salary, p.net_salary, p.payment_status,
                        p.payment_date, e.employee_code, e.first_name,
                        e.middle_name, e.last_name, e.email, e.position,
@@ -47,15 +49,7 @@ if ($payrollId === false || ($isEmployee && $employeeId === false)) {
 $escape = static function ($value): string {
     return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
 };
-$displayMoney = static function ($amount): string {
-    $value = (string) ($amount ?? '0.00');
-    if (!preg_match('/^(\d{1,10})(?:\.(\d{1,2}))?$/D', $value, $parts)) {
-        return '0.00';
-    }
-    $whole = (int) $parts[1];
-    $fraction = (int) str_pad($parts[2] ?? '', 2, '0');
-    return number_format($whole, 0, '.', ',') . '.' . str_pad((string) $fraction, 2, '0');
-};
+$totalDeductions = $record === null ? 0 : payroll_total_deductions_cents($record);
 $pageTitle = 'Payslip';
 $activePage = 'payroll';
 require __DIR__ . '/includes/header.php';
@@ -95,12 +89,16 @@ require __DIR__ . '/includes/sidebar.php';
             <table class="payslip-table">
                 <thead><tr><th scope="col">Salary component</th><th scope="col">Amount</th></tr></thead>
                 <tbody>
-                    <tr><td>Basic salary</td><td><?= $escape($displayMoney($record['basic_salary'])) ?></td></tr>
-                    <tr><td>Allowances</td><td><?= $escape($displayMoney($record['allowances'])) ?></td></tr>
-                    <tr><td>Overtime pay</td><td><?= $escape($displayMoney($record['overtime_pay'])) ?></td></tr>
-                    <tr class="payslip-total"><th scope="row">Gross salary</th><td><?= $escape($displayMoney($record['gross_salary'])) ?></td></tr>
-                    <tr><td>Deductions</td><td>− <?= $escape($displayMoney($record['deductions'])) ?></td></tr>
-                    <tr class="payslip-net"><th scope="row">Net salary</th><td><?= $escape($displayMoney($record['net_salary'])) ?></td></tr>
+                    <tr><td>Basic salary</td><td><?= $escape(payroll_money($record['basic_salary'])) ?></td></tr>
+                    <tr><td>Allowances</td><td><?= $escape(payroll_money($record['allowances'])) ?></td></tr>
+                    <tr><td>Overtime pay</td><td><?= $escape(payroll_money($record['overtime_pay'])) ?></td></tr>
+                    <tr class="payslip-total"><th scope="row">Gross salary</th><td><?= $escape(payroll_money($record['gross_salary'])) ?></td></tr>
+                    <tr><td>SSS</td><td>− <?= $escape(payroll_money($record['sss_deduction'])) ?></td></tr>
+                    <tr><td>PhilHealth</td><td>− <?= $escape(payroll_money($record['philhealth_deduction'])) ?></td></tr>
+                    <tr><td>Pag-IBIG</td><td>− <?= $escape(payroll_money($record['pagibig_deduction'])) ?></td></tr>
+                    <tr><td>Other deductions</td><td>− <?= $escape(payroll_money($record['deductions'])) ?></td></tr>
+                    <tr class="payslip-total"><th scope="row">Total deductions</th><td>− <?= $escape(payroll_money(payroll_cents_to_amount($totalDeductions))) ?></td></tr>
+                    <tr class="payslip-net"><th scope="row">Net salary</th><td><?= $escape(payroll_money($record['net_salary'])) ?></td></tr>
                 </tbody>
             </table>
         </div>

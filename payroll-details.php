@@ -1,10 +1,15 @@
 <?php
 require __DIR__ . '/includes/auth.php';
-auth_require_roles(['Admin', 'Employee']);
+auth_require_roles(['Admin', 'HR', 'Employee']);
 require __DIR__ . '/config/db.php';
+require __DIR__ . '/includes/payroll_helpers.php';
 
 $user = auth_current_user();
 $isEmployee = $user['role'] === 'Employee';
+if (empty($_SESSION['payroll_csrf'])) {
+    $_SESSION['payroll_csrf'] = bin2hex(random_bytes(32));
+}
+$csrfToken = $_SESSION['payroll_csrf'];
 $payrollId = filter_var($_GET['id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
 $record = null;
 $loadError = null;
@@ -27,7 +32,9 @@ if ($payrollId === false || ($isEmployee && $employeeId === false)) {
     try {
         $sql = 'SELECT p.payroll_id, p.employee_id, p.pay_period_start,
                        p.pay_period_end, p.basic_salary, p.allowances,
-                       p.overtime_pay, p.deductions, p.gross_salary, p.net_salary,
+                       p.overtime_pay, p.deductions, p.sss_deduction,
+                       p.philhealth_deduction, p.pagibig_deduction,
+                       p.gross_salary, p.net_salary,
                        p.payment_status, p.payment_date, p.created_at,
                        e.employee_code, e.first_name, e.middle_name, e.last_name,
                        e.email, e.position, e.hire_date, d.department_name
@@ -55,15 +62,7 @@ if ($payrollId === false || ($isEmployee && $employeeId === false)) {
 $escape = static function ($value): string {
     return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
 };
-$displayMoney = static function ($amount): string {
-    $value = (string) ($amount ?? '0.00');
-    if (!preg_match('/^(\d{1,10})(?:\.(\d{1,2}))?$/D', $value, $parts)) {
-        return '0.00';
-    }
-    $whole = (int) $parts[1];
-    $fraction = (int) str_pad($parts[2] ?? '', 2, '0');
-    return number_format($whole, 0, '.', ',') . '.' . str_pad((string) $fraction, 2, '0');
-};
+$totalDeductions = $record === null ? 0 : payroll_total_deductions_cents($record);
 $pageTitle = 'Payroll details';
 $activePage = 'payroll';
 $notice = $_SESSION['payroll_notice'] ?? null;
@@ -102,43 +101,39 @@ require __DIR__ . '/includes/sidebar.php';
             <div><dt>Email</dt><dd><?= $escape($record['email']) ?></dd></div>
             <div><dt>Hire date</dt><dd><?= $escape(date('M j, Y', strtotime($record['hire_date']))) ?></dd></div>
             <div><dt>Pay period</dt><dd><?= $escape(date('M j, Y', strtotime($record['pay_period_start']))) ?> – <?= $escape(date('M j, Y', strtotime($record['pay_period_end']))) ?></dd></div>
-            <div><dt>Basic salary</dt><dd><?= $escape($displayMoney($record['basic_salary'])) ?></dd></div>
-            <div><dt>Allowances</dt><dd><?= $escape($displayMoney($record['allowances'])) ?></dd></div>
-            <div><dt>Overtime pay</dt><dd><?= $escape($displayMoney($record['overtime_pay'])) ?></dd></div>
-            <div><dt>Gross salary</dt><dd><?= $escape($displayMoney($record['gross_salary'])) ?></dd></div>
-            <div><dt>Deductions</dt><dd><?= $escape($displayMoney($record['deductions'])) ?></dd></div>
-            <div class="payroll-net"><dt>Net salary</dt><dd><?= $escape($displayMoney($record['net_salary'])) ?></dd></div>
+            <div><dt>Basic salary</dt><dd><?= $escape(payroll_money($record['basic_salary'])) ?></dd></div>
+            <div><dt>Allowances</dt><dd><?= $escape(payroll_money($record['allowances'])) ?></dd></div>
+            <div><dt>Overtime pay</dt><dd><?= $escape(payroll_money($record['overtime_pay'])) ?></dd></div>
+            <div><dt>Gross salary</dt><dd><?= $escape(payroll_money($record['gross_salary'])) ?></dd></div>
+            <div><dt>SSS</dt><dd><?= $escape(payroll_money($record['sss_deduction'])) ?></dd></div>
+            <div><dt>PhilHealth</dt><dd><?= $escape(payroll_money($record['philhealth_deduction'])) ?></dd></div>
+            <div><dt>Pag-IBIG</dt><dd><?= $escape(payroll_money($record['pagibig_deduction'])) ?></dd></div>
+            <div><dt>Other deductions</dt><dd><?= $escape(payroll_money($record['deductions'])) ?></dd></div>
+            <div><dt>Total deductions</dt><dd><?= $escape(payroll_money(payroll_cents_to_amount($totalDeductions))) ?></dd></div>
+            <div class="payroll-net"><dt>Net salary</dt><dd><?= $escape(payroll_money($record['net_salary'])) ?></dd></div>
             <div><dt>Payment status</dt><dd><?= $escape($record['payment_status']) ?></dd></div>
             <div><dt>Payment date</dt><dd><?= $record['payment_date'] !== null ? $escape(date('M j, Y', strtotime($record['payment_date']))) : 'Not paid' ?></dd></div>
         </dl>
         <div class="payroll-detail-actions">
             <a class="button button-secondary" href="payslip.php?id=<?= (int) $record['payroll_id'] ?>">View printable payslip</a>
-            <?php if (!$isEmployee): ?>
+            <?php if (!$isEmployee && $record['payment_status'] === 'Pending'): ?>
                 <form method="post" action="payroll.php" onsubmit="return confirm('Mark payroll #<?= (int) $record['payroll_id'] ?> as <?= $record['payment_status'] === 'Pending' ? 'paid' : 'unpaid' ?>?')">
-                    <input type="hidden" name="csrf_token" value="<?= $escape(auth_csrf_token()) ?>">
-                    <input type="hidden" name="action" value="set_status">
+                    <input type="hidden" name="csrf_token" value="<?= $escape($csrfToken) ?>">
+                    <input type="hidden" name="action" value="mark_paid">
                     <input type="hidden" name="payroll_id" value="<?= (int) $record['payroll_id'] ?>">
-                    <input type="hidden" name="payment_status" value="<?= $record['payment_status'] === 'Pending' ? 'Paid' : 'Pending' ?>">
-                    <button class="button button-primary" type="submit">Mark as <?= $record['payment_status'] === 'Pending' ? 'paid' : 'unpaid' ?></button>
+                    <button class="button button-primary" type="submit">Mark as paid</button>
                 </form>
             <?php endif; ?>
         </div>
         <?php if (!$isEmployee && $record['payment_status'] === 'Pending'): ?>
             <?php
             $editValues = is_array($editFormValues) ? array_merge([
-                'pay_period_start' => $record['pay_period_start'],
-                'pay_period_end' => $record['pay_period_end'],
-                'basic_salary' => $record['basic_salary'],
                 'allowances' => $record['allowances'],
                 'overtime_pay' => $record['overtime_pay'],
                 'deductions' => $record['deductions'],
             ], array_intersect_key($editFormValues, array_flip([
-                'pay_period_start', 'pay_period_end', 'basic_salary',
                 'allowances', 'overtime_pay', 'deductions',
             ]))) : [
-                'pay_period_start' => $record['pay_period_start'],
-                'pay_period_end' => $record['pay_period_end'],
-                'basic_salary' => $record['basic_salary'],
                 'allowances' => $record['allowances'],
                 'overtime_pay' => $record['overtime_pay'],
                 'deductions' => $record['deductions'],
@@ -147,18 +142,15 @@ require __DIR__ . '/includes/sidebar.php';
             <details class="payroll-edit-disclosure">
                 <summary class="button button-secondary">Edit pending payroll</summary>
                 <form class="employee-form" method="post" action="payroll.php">
-                    <input type="hidden" name="csrf_token" value="<?= $escape(auth_csrf_token()) ?>">
-                    <input type="hidden" name="action" value="update_pending">
+                    <input type="hidden" name="csrf_token" value="<?= $escape($csrfToken) ?>">
+                    <input type="hidden" name="action" value="update_amounts">
                     <input type="hidden" name="payroll_id" value="<?= (int) $record['payroll_id'] ?>">
                     <div class="form-grid">
-                        <div class="form-field"><label for="pay_period_start">Pay period start</label><input id="pay_period_start" name="pay_period_start" type="date" value="<?= $escape($editValues['pay_period_start']) ?>" required></div>
-                        <div class="form-field"><label for="pay_period_end">Pay period end</label><input id="pay_period_end" name="pay_period_end" type="date" value="<?= $escape($editValues['pay_period_end']) ?>" required></div>
-                        <div class="form-field"><label for="basic_salary">Basic salary</label><input id="basic_salary" name="basic_salary" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($editValues['basic_salary']) ?>" required></div>
                         <div class="form-field"><label for="allowances">Allowances</label><input id="allowances" name="allowances" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($editValues['allowances']) ?>" required></div>
                         <div class="form-field"><label for="overtime_pay">Overtime pay</label><input id="overtime_pay" name="overtime_pay" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($editValues['overtime_pay']) ?>" required></div>
-                        <div class="form-field"><label for="deductions">Deductions</label><input id="deductions" name="deductions" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($editValues['deductions']) ?>" required></div>
+                        <div class="form-field"><label for="deductions">Other deductions</label><input id="deductions" name="deductions" type="number" min="0" max="9999999999.99" step="0.01" value="<?= $escape($editValues['deductions']) ?>" required></div>
                     </div>
-                    <p class="form-help">Gross and net amounts are recalculated when saved. Paid payroll records cannot be edited.</p>
+                    <p class="form-help">Statutory deductions are preserved. Gross and net amounts are recalculated when saved; paid payroll records cannot be edited.</p>
                     <div class="form-actions"><button class="button button-primary" type="submit">Save payroll changes</button></div>
                 </form>
             </details>

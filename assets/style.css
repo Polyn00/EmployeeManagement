@@ -914,21 +914,21 @@ tbody tr:last-child td {
 }
 
 .leave-status-approved {
-    border-color: rgba(99, 214, 162, 0.2);
-    background: rgba(99, 214, 162, 0.08);
-    color: #83ddb4;
+    border-color: rgb(180, 228, 207);
+    background: rgb(6, 95, 55);
+    color: #ffffff;
 }
 
 .leave-status-pending {
-    border-color: rgba(255, 190, 91, 0.2);
-    background: rgba(255, 190, 91, 0.08);
-    color: #ffcc78;
+    border-color: rgba(151, 148, 234, 0.2);
+    background: rgb(29, 3, 145);
+    color: #ffffff;
 }
 
 .leave-status-rejected {
-    border-color: rgba(244, 123, 140, 0.2);
-    background: rgba(244, 123, 140, 0.08);
-    color: #f49aaa;
+    border-color: rgb(200, 173, 177);
+    background: rgb(141, 11, 28);
+    color: #fcfcfc;
 }
 
 .leave-filters .filter-field {
